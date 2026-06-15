@@ -38,7 +38,7 @@ import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
@@ -242,6 +242,12 @@ class BaseRunner(ABC):
         _flashinfer_autotune and friends) lives on BaseRunner now and reads the
         shared ModelRunner state through self.model_runner; warmup() is the
         orchestration that drives it.
+
+        The flashinfer-autotune dummy forward reuses this runner's already-
+        allocated static decode buffers (via _autotune_buffers) instead of
+        allocating a throwaway set; runners with no reusable decode buffers (the
+        prefill cuda-graph runner, the eager runner) return (None, None) and we
+        fall back to a freshly-allocated dummy set sized to req_to_token_pool.size.
         """
         mr = self.model_runner
         if getattr(mr, "_kernel_warmed_up", False):
@@ -257,7 +263,28 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
 
         if self._should_run_flashinfer_autotune():
-            self._flashinfer_autotune()
+            buffers, batch_size = self._autotune_buffers()
+            if buffers is None:
+                # No reusable static buffers, so build a dummy decode set sized
+                # to req_to_token_pool.size. Spec target workers verify
+                # num_tokens_per_bs tokens/req, so size for that.
+                batch_size = mr.req_to_token_pool.size
+                num_tokens_per_bs = 1
+                if mr.spec_algorithm.is_speculative() and not mr.is_draft_worker:
+                    num_tokens_per_bs = (
+                        mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                            mr.server_args.speculative_num_draft_tokens,
+                            mr.is_draft_worker,
+                        )
+                    )
+                # MLP sync pads token counts to a multiple of attn_tp_size; the
+                # dummy forward must match or its collectives mismatch.
+                if require_mlp_sync(mr.server_args) and self.attn_tp_size > 1:
+                    batch_size = ceil_align(batch_size, self.attn_tp_size)
+                buffers = self._alloc_dummy_decode_buffers(
+                    batch_size, num_tokens_per_bs=num_tokens_per_bs
+                )
+            self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -345,8 +372,14 @@ class BaseRunner(ABC):
 
         return True
 
-    def _flashinfer_autotune(self):
-        """Run flashinfer autotune."""
+    def _flashinfer_autotune(self, *, buffers, batch_size):
+        """Run flashinfer autotune.
+
+        buffers / batch_size: a prepared static decode-buffer set and its bs,
+        reused for the dummy forward instead of allocating a throwaway set.
+        Supplied by warmup() (the decode runner's captured buffers when a graph
+        runner exists; a freshly-allocated dummy set in the eager path).
+        """
         from flashinfer.autotuner import autotune
 
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
@@ -378,7 +411,7 @@ class BaseRunner(ABC):
                 autotune(True, cache=str(autotune_cache)),
                 autotune_dummy_run_mode(),
             ):
-                self._dummy_run(batch_size=mr.req_to_token_pool.size)
+                self._dummy_run(batch_size=batch_size, buffers=buffers)
         torch.cuda.current_stream().wait_stream(mr.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
@@ -418,16 +451,62 @@ class BaseRunner(ABC):
             cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
         )
 
+    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
+        """Allocate one static decode-buffer set for a dummy forward, sized to
+        (max_bs, max_bs * num_tokens_per_bs).
+
+        For callers that have no pre-allocated static buffers to reuse -- the
+        PP-parallel DeepGEMM warmup sweeps batch sizes far larger than the decode
+        runner's max_bs, and the eager (no graph runner) autotune path has no
+        runner buffers -- build one here and hand it to _dummy_run (reused across
+        the sweep; _dummy_run slices it per shape). When a decode graph runner
+        exists, the flashinfer autotune instead reuses that runner's own buffers.
+        """
+        mr = self.model_runner
+        return _allocate_decode_buffers(
+            device=mr.device,
+            max_bs=max_bs,
+            max_num_token=max_bs * num_tokens_per_bs,
+            hidden_size=mr.model_config.hidden_size,
+            vocab_size=mr.model_config.vocab_size,
+            dtype=mr.model_config.dtype,
+            dp_size=mr.server_args.dp_size,
+            pp_size=mr.server_args.pp_size,
+            is_encoder_decoder=mr.model_config.is_encoder_decoder,
+            require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
+            seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
+            encoder_len_fill_value=(
+                getattr(mr.model_config.hf_config, "max_source_positions", 0)
+                if mr.model_config.is_encoder_decoder
+                else 0
+            ),
+            num_tokens_per_bs=num_tokens_per_bs,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+            hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+        )
+
     def _dummy_run(
         self,
         batch_size: int,
         run_ctx=None,
         forward_mode_override: Optional[ForwardMode] = None,
+        *,
+        buffers,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
         forward_mode_override forces EXTEND/DECODE regardless of
         is_generation (used by the PP-parallel DeepGEMM warmup).
+
+        buffers: a prepared static decode-buffer set, sized >= this dummy shape,
+        which _dummy_run slices to (batch_size, num_tokens). The caller owns the
+        shape and the allocation -- the flashinfer autotune reuses the decode
+        runner's buffers (at its captured max_bs) or, in the eager path, a set
+        from _alloc_dummy_decode_buffers; the PP-DeepGEMM warmup builds one via
+        _alloc_dummy_decode_buffers. _dummy_run never allocates and never re-pads
+        (autotune must run at the captured shape; the PP warmup pre-pads and
+        sizes its buffer to match).
         """
         mr = self.model_runner
         if forward_mode_override is not None:
@@ -454,12 +533,25 @@ class BaseRunner(ABC):
 
         num_tokens = batch_size * num_tokens_per_bs
 
-        # Keep warmup aligned with scheduler MLP-sync padding.
-        if require_mlp_sync(mr.server_args):
-            attn_tp_size = get_attention_tp_size()
-            if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
-                num_tokens = ceil_align(num_tokens, attn_tp_size)
-                batch_size = num_tokens // num_tokens_per_bs
+        # The caller owns the shape: it passes a prepared static buffer sized
+        # >= this dummy shape, which we slice below. _dummy_run neither allocates
+        # nor re-pads -- autotune must run at the runner's captured shape (re-
+        # padding could overflow the reused buffers), and the PP-DeepGEMM warmup
+        # applies its own MLP-sync padding before sizing its buffer.
+        assert (
+            buffers is not None
+            and num_tokens <= buffers.input_ids.shape[0]
+            and batch_size <= buffers.seq_lens.shape[0]
+        ), (
+            f"_dummy_run needs a static buffer >= (num_tokens={num_tokens}, "
+            f"batch_size={batch_size}); got "
+            + (
+                "None"
+                if buffers is None
+                else f"(input_ids={buffers.input_ids.shape[0]}, "
+                f"seq_lens={buffers.seq_lens.shape[0]})"
+            )
+        )
 
         seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
 
@@ -483,28 +575,24 @@ class BaseRunner(ABC):
         if require_gathered_buffer(mr.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(mr.server_args)
 
-        buffers = _allocate_decode_buffers(
-            device=mr.device,
-            max_bs=batch_size,
-            max_num_token=num_tokens,
-            hidden_size=mr.model_config.hidden_size,
-            vocab_size=mr.model_config.vocab_size,
-            dtype=mr.model_config.dtype,
-            dp_size=mr.server_args.dp_size,
-            pp_size=mr.server_args.pp_size,
-            is_encoder_decoder=mr.model_config.is_encoder_decoder,
-            require_mlp_tp_gather=require_mlp_tp_gather_,
-            seq_len_fill_value=seq_len_fill_value,
-            encoder_len_fill_value=(
-                getattr(mr.model_config.hf_config, "max_source_positions", 0)
-                if mr.model_config.is_encoder_decoder
-                else 0
-            ),
-            num_tokens_per_bs=num_tokens_per_bs,
-            cache_loc_dtype=torch.int64,
-            enable_mamba_track=False,
-            hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+        # Slice the (possibly larger, reused) static buffers to this dummy shape.
+        # The runner repopulates every field at capture/reserve, and the PP
+        # warmup discards its buffer, so the writes below (and the metadata init)
+        # are transient.
+        input_ids = buffers.input_ids[:num_tokens]
+        positions = buffers.positions[:num_tokens]
+        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        req_pool_indices = buffers.req_pool_indices[:batch_size]
+        seq_lens = buffers.seq_lens[:batch_size]
+        seq_lens_cpu = buffers.seq_lens_cpu[:batch_size]
+        encoder_lens = (
+            buffers.encoder_lens[:batch_size]
+            if buffers.encoder_lens is not None
+            else None
         )
+
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
@@ -590,17 +678,17 @@ class BaseRunner(ABC):
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
-            input_ids=buffers.input_ids,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-            next_token_logits_buffer=buffers.next_token_logits_buffer,
-            orig_seq_lens=buffers.seq_lens,
-            out_cache_loc=buffers.out_cache_loc,
-            seq_lens_sum=buffers.seq_lens.sum().item(),
-            encoder_lens=buffers.encoder_lens,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
             return_logprob=False,
-            positions=buffers.positions,
+            positions=positions,
             extend_num_tokens=extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -612,7 +700,7 @@ class BaseRunner(ABC):
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=buffers.mrope_positions,
+            mrope_positions=mrope_positions,
             spec_algorithm=mr.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
@@ -648,7 +736,7 @@ class BaseRunner(ABC):
                 kwargs["get_embedding"] = True
 
             logits_output_or_pp_proxy_tensors = mr.model.forward(
-                buffers.input_ids,
+                input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
@@ -660,6 +748,20 @@ class BaseRunner(ABC):
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             with torch.inference_mode(), run_ctx or empty_context():
                 run_once()
+
+    def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
+        """Static decode buffers + max captured bs for warmup() to hand the
+        flashinfer-autotune dummy forward, so it reuses this runner's already-
+        allocated buffers instead of allocating a throwaway set.
+
+        Returns (None, None) by default. Only the decode runner overrides this:
+        its buffers carry every field the dummy decode forward reads. Prefill
+        buffers deliberately do not (no seq_lens / req_pool_indices / logits
+        buffer), and the eager runner's grow-on-demand buffers are not sized to
+        a single captured bs, so both fall back to a dummy decode set allocated
+        in warmup().
+        """
+        return None, None
 
     @abstractmethod
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool: ...
