@@ -54,6 +54,7 @@ PER_COMMIT_SUITES = {
         # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
+        "extra-a-test-2-gpu-large-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
